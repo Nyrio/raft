@@ -226,7 +226,8 @@ void kmeansPlusPlus(const raft::handle_t& handle,
                                 temp_storage_bytes,
                                 costPerCandidate.data_handle(),
                                 minClusterIndexAndDistance.data(),
-                                costPerCandidate.extent(0));
+                                costPerCandidate.extent(0),
+                                stream);
 
       // Allocate temporary storage
       workspace.resize(temp_storage_bytes, stream);
@@ -236,10 +237,12 @@ void kmeansPlusPlus(const raft::handle_t& handle,
                                 temp_storage_bytes,
                                 costPerCandidate.data_handle(),
                                 minClusterIndexAndDistance.data(),
-                                costPerCandidate.extent(0));
+                                costPerCandidate.extent(0),
+                                stream);
 
       int bestCandidateIdx = -1;
       raft::copy(&bestCandidateIdx, &minClusterIndexAndDistance.data()->key, 1, stream);
+      handle.sync_stream();
       /// <<< End of Step-3 >>>
 
       /// <<< Step-4 >>>: C = C U {x}
@@ -881,20 +884,6 @@ void kmeans_fit(handle_t const& handle,
 
   logger::get(RAFT_NAME).set_level(params.verbosity);
 
-  // Allocate memory
-  rmm::device_uvector<char> workspace(0, stream);
-  auto weight = raft::make_device_vector<DataT>(handle, n_samples);
-  if (sample_weight.has_value())
-    raft::copy(weight.data_handle(), sample_weight.value().data_handle(), n_samples, stream);
-  else
-    thrust::fill(
-      handle.get_thrust_policy(), weight.data_handle(), weight.data_handle() + weight.size(), 1);
-
-  // check if weights sum up to n_samples
-  checkWeight<DataT>(handle, weight.view(), workspace);
-
-  auto centroidsRawData = raft::make_device_matrix<DataT, IndexT>(handle, n_clusters, n_features);
-
   auto n_init = params.n_init;
   if (params.init == KMeansParams::InitMethod::Array && n_init != 1) {
     RAFT_LOG_DEBUG(
@@ -905,15 +894,50 @@ void kmeans_fit(handle_t const& handle,
   }
 
   std::mt19937 gen(params.rng_state.seed);
-  inertia[0] = std::numeric_limits<DataT>::max();
+
+  // Objects and buffers needed for each thread
+  std::vector<rmm::device_uvector<char>> thread_workspace;
+  std::vector<raft::device_matrix<DataT, IndexT>> thread_centroids;
+  std::vector<KMeansParams> thread_params;
+  std::vector<DataT> thread_inertia(n_init, std::numeric_limits<DataT>::max());
+  std::vector<IndexT> thread_n_iter(n_init, 0);
+
+  const rmm::cuda_stream_pool& stream_pool = handle.get_or_create_stream_pool();
+  cudaEvent_t start_event;
+  RAFT_CUDA_TRY(cudaEventCreateWithFlags(&start_event, cudaEventDisableTiming));
+  RAFT_CUDA_TRY(cudaEventRecord(start_event, stream));
 
   for (auto seed_iter = 0; seed_iter < n_init; ++seed_iter) {
+    thread_workspace.emplace_back(0, stream);
+    thread_centroids.push_back(
+      raft::make_device_matrix<DataT, IndexT>(handle, n_clusters, n_features));
+
+    // For determinism, the seed is assigned in this sequential loop.
     KMeansParams iter_params   = params;
     iter_params.rng_state.seed = gen();
+    thread_params.push_back(iter_params);
+  }
 
-    DataT iter_inertia    = std::numeric_limits<DataT>::max();
-    IndexT n_current_iter = 0;
-    if (iter_params.init == KMeansParams::InitMethod::Random) {
+  auto weight = raft::make_device_vector<DataT>(handle, n_samples);
+  // todo(lsugy): why copy??
+  if (sample_weight.has_value())
+    raft::copy(weight.data_handle(), sample_weight.value().data_handle(), n_samples, stream);
+  else
+    thrust::fill(
+      handle.get_thrust_policy(), weight.data_handle(), weight.data_handle() + weight.size(), 1);
+
+  // check if weights sum up to n_samples
+  checkWeight<DataT>(handle, weight.view(), thread_workspace[0]);
+
+#pragma omp parallel for
+  for (auto seed_iter = 0; seed_iter < n_init; ++seed_iter) {
+    // Get a stream from the pool, wait on the start event from the main stream, and make a handle
+    // wrapping that stream
+    cudaStream_t thread_stream = stream_pool.get_stream();
+    RAFT_CUDA_TRY(cudaStreamWaitEvent(thread_stream, start_event, 0));
+    raft::handle_t thread_handle(thread_stream);
+
+    if (thread_params[seed_iter].init == KMeansParams::InitMethod::Random) {
       // initializing with random samples from input dataset
       RAFT_LOG_DEBUG(
         "KMeans.fit (Iteration-%d/%d): initialize cluster centers by "
@@ -921,53 +945,76 @@ void kmeans_fit(handle_t const& handle,
         "input data.",
         seed_iter + 1,
         n_init);
-      initRandom<DataT, IndexT>(handle, iter_params, X, centroidsRawData.view());
-    } else if (iter_params.init == KMeansParams::InitMethod::KMeansPlusPlus) {
+      initRandom<DataT, IndexT>(
+        thread_handle, thread_params[seed_iter], X, thread_centroids[seed_iter].view());
+    } else if (thread_params[seed_iter].init == KMeansParams::InitMethod::KMeansPlusPlus) {
       // default method to initialize is kmeans++
       RAFT_LOG_DEBUG(
         "KMeans.fit (Iteration-%d/%d): initialize cluster centers using "
         "k-means++ algorithm.",
         seed_iter + 1,
         n_init);
-      if (iter_params.oversampling_factor == 0)
-        detail::kmeansPlusPlus<DataT, IndexT>(
-          handle, iter_params, X, centroidsRawData.view(), workspace);
+      if (thread_params[seed_iter].oversampling_factor == 0)
+        detail::kmeansPlusPlus<DataT, IndexT>(thread_handle,
+                                              thread_params[seed_iter],
+                                              X,
+                                              thread_centroids[seed_iter].view(),
+                                              thread_workspace[seed_iter]);
       else
-        detail::initScalableKMeansPlusPlus<DataT, IndexT>(
-          handle, iter_params, X, centroidsRawData.view(), workspace);
-    } else if (iter_params.init == KMeansParams::InitMethod::Array) {
+        detail::initScalableKMeansPlusPlus<DataT, IndexT>(thread_handle,
+                                                          thread_params[seed_iter],
+                                                          X,
+                                                          thread_centroids[seed_iter].view(),
+                                                          thread_workspace[seed_iter]);
+    } else if (thread_params[seed_iter].init == KMeansParams::InitMethod::Array) {
       RAFT_LOG_DEBUG(
         "KMeans.fit (Iteration-%d/%d): initialize cluster centers from "
         "the ndarray array input "
         "passed to init argument.",
         seed_iter + 1,
         n_init);
-      raft::copy(
-        centroidsRawData.data_handle(), centroids.data_handle(), n_clusters * n_features, stream);
+      raft::copy(thread_centroids[seed_iter].data_handle(),
+                 centroids.data_handle(),
+                 n_clusters * n_features,
+                 stream);
     } else {
       THROW("unknown initialization method to select initial centers");
     }
 
-    detail::kmeans_fit_main<DataT, IndexT>(handle,
-                                           iter_params,
-                                           X,
-                                           weight.view(),
-                                           centroidsRawData.view(),
-                                           raft::make_host_scalar_view<DataT>(&iter_inertia),
-                                           raft::make_host_scalar_view<IndexT>(&n_current_iter),
-                                           workspace);
-    if (iter_inertia < inertia[0]) {
-      inertia[0] = iter_inertia;
-      n_iter[0]  = n_current_iter;
-      raft::copy(
-        centroids.data_handle(), centroidsRawData.data_handle(), n_clusters * n_features, stream);
-    }
-    RAFT_LOG_DEBUG("KMeans.fit after iteration-%d/%d: inertia - %f, n_iter[0] - %d",
+    // Note: for now, the stream is synchronized inside kmeans_fit_main
+    detail::kmeans_fit_main<DataT, IndexT>(
+      thread_handle,
+      thread_params[seed_iter],
+      X,
+      weight.view(),
+      thread_centroids[seed_iter].view(),
+      raft::make_host_scalar_view<DataT>(&thread_inertia[seed_iter]),
+      raft::make_host_scalar_view<IndexT>(&thread_n_iter[seed_iter]),
+      thread_workspace[seed_iter]);
+  }
+
+  int best_iter = 0;
+  for (auto seed_iter = 0; seed_iter < n_init; ++seed_iter) {
+    RAFT_LOG_DEBUG("KMeans.fit, results of iteration-%d/%d: inertia - %f, n_iter - %d",
                    seed_iter + 1,
                    n_init,
-                   inertia[0],
-                   n_iter[0]);
+                   thread_inertia[seed_iter],
+                   thread_n_iter[seed_iter]);
+    if (thread_inertia[seed_iter] < thread_inertia[best_iter]) { best_iter = seed_iter; }
   }
+  RAFT_LOG_DEBUG("KMeans.fit, best iteration is %d/%d with: inertia - %f, n_iter - %d",
+                 best_iter + 1,
+                 n_init,
+                 thread_inertia[best_iter],
+                 thread_n_iter[best_iter]);
+
+  inertia[0] = thread_inertia[best_iter];
+  n_iter[0]  = thread_n_iter[best_iter];
+  raft::copy(centroids.data_handle(),
+             thread_centroids[best_iter].data_handle(),
+             n_clusters * n_features,
+             stream);
+
   RAFT_LOG_DEBUG("KMeans.fit: async call returned (fit could still be running on the device)");
 }
 

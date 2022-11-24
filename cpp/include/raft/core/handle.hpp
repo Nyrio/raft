@@ -161,6 +161,17 @@ class handle_t {
     return *stream_pool_;
   }
 
+  /**
+   * @brief returns stream pool on the handle, create if missing
+   * @param[in] pool_size Pool size to use if the pool needs to be created
+   * @return A reference to the pool
+   */
+  const rmm::cuda_stream_pool& get_or_create_stream_pool(std::size_t pool_size = 16) const
+  {
+    if (!is_stream_pool_initialized()) { stream_pool_ = std::make_shared<rmm::cuda_stream_pool>(); }
+    return *stream_pool_;
+  }
+
   std::size_t get_stream_pool_size() const
   {
     return is_stream_pool_initialized() ? stream_pool_->get_pool_size() : 0;
@@ -288,7 +299,7 @@ class handle_t {
   mutable bool cusparse_initialized_{false};
   std::unique_ptr<rmm::exec_policy> thrust_policy_{nullptr};
   rmm::cuda_stream_view stream_view_{rmm::cuda_stream_per_thread};
-  std::shared_ptr<rmm::cuda_stream_pool> stream_pool_{nullptr};
+  mutable std::shared_ptr<rmm::cuda_stream_pool> stream_pool_{nullptr};
   cudaEvent_t event_;
   mutable cudaDeviceProp prop_;
   mutable bool device_prop_initialized_{false};
